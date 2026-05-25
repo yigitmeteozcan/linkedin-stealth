@@ -16,6 +16,8 @@ import scraper
 import tracker
 from utils import escape_table_cell, sanitize_for_log, sanitize_string
 
+FAKE_API_KEY = "test_api_key_scenario_abc"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -29,13 +31,11 @@ def _write_csv(path: str, rows: list) -> None:
             writer.writerow(row)
 
 
-def _mock_response(text: str = "<html></html>", status: int = 200) -> MagicMock:
+def _mock_api_response(status_code: int = 200, json_data: dict = None) -> MagicMock:
+    """Build a mock Enrichlayer API response."""
     r = MagicMock()
-    r.text = text
-    r.status_code = status
-    r.raise_for_status = MagicMock()
-    r.url = "https://www.google.com/search"
-    r.headers = {"content-type": "text/html; charset=utf-8"}
+    r.status_code = status_code
+    r.json.return_value = json_data if json_data is not None else {"occupation": "", "headline": ""}
     return r
 
 
@@ -72,7 +72,6 @@ class TestCsvFormulaInjection(unittest.TestCase):
     def test_equals_formula_defused_in_name(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "test.csv")
-            # Use _write_csv (DictWriter) so the formula is properly CSV-quoted
             _write_csv(path, [
                 {"name": '=HYPERLINK("http://evil.com","click")',
                  "linkedin_url": "https://linkedin.com/in/victim", "notes": "test"},
@@ -139,7 +138,6 @@ class TestMarkdownPipeInjection(unittest.TestCase):
     def test_pipe_escaped_in_table_cell(self):
         name = "John | DROP TABLE | notes"
         escaped = escape_table_cell(name)
-        # Literal | must be replaced with \|
         self.assertNotIn("|", escaped.replace(r"\|", ""))
 
     def test_pipe_appears_as_escaped(self):
@@ -158,22 +156,20 @@ class TestMarkdownPipeInjection(unittest.TestCase):
             ])
 
             def fake_scrape(url):
-                return {"success": True, "title": "Founder", "snippet": "", "raw": "", "error": None}
+                return {"success": True, "title": "Founder", "snippet": "", "raw": {}, "error": None}
 
-            with patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
                  patch("tracker.time.sleep"):
                 tracker.run(csv_path, state_path, results_path)
 
             with open(results_path, encoding="utf-8") as f:
                 content = f.read()
 
-            # Every table row should have the same number of columns (7 for stealth table)
             for line in content.splitlines():
                 if line.startswith("| John"):
-                    # Count unescaped pipes: replace \| first, then count |
                     unescaped = line.replace(r"\|", "")
                     col_count = unescaped.count("|")
-                    # 7-column table has 8 pipes (one per boundary)
                     self.assertEqual(col_count, 8, f"Unexpected column count in line: {line!r}")
 
 
@@ -205,16 +201,16 @@ class TestNewlineInjectionInNotes(unittest.TestCase):
             ])
 
             def fake_scrape(url):
-                return {"success": True, "title": "Founder", "snippet": "", "raw": "", "error": None}
+                return {"success": True, "title": "Founder", "snippet": "", "raw": {}, "error": None}
 
-            with patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
                  patch("tracker.time.sleep"):
                 tracker.run(csv_path, state_path, results_path)
 
             with open(results_path, encoding="utf-8") as f:
                 lines = f.readlines()
 
-            # No line should be "new row injected" floating alone
             plain_lines = [l.strip() for l in lines]
             self.assertNotIn("new row injected", plain_lines)
 
@@ -239,13 +235,11 @@ class TestUrlWithWhitespace(unittest.TestCase):
 
     def test_url_with_newline_rejected(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
-            # Write raw bytes so the newline is embedded in the field
             f.write("name,linkedin_url,notes\n")
             f.write('"John","https://linkedin.com/in/john\nsmith","test"\n')
             path = f.name
         try:
             profiles = tracker.load_profiles(path)
-            # Either rejected outright or the URL contains \n and is invalid
             for p in profiles:
                 self.assertNotIn("\n", p["linkedin_url"])
         finally:
@@ -262,103 +256,99 @@ class TestUrlWithWhitespace(unittest.TestCase):
                 {"name": "Bob", "linkedin_url": "https://linkedin.com/in/bob jones", "notes": ""},
             ])
 
-            with patch("tracker.scraper.scrape_profile") as mock_scrape:
-                with patch("tracker.time.sleep"):
-                    tracker.run(csv_path, state_path, results_path)
-                mock_scrape.assert_not_called()
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile") as mock_scrape, \
+                 patch("tracker.time.sleep"):
+                tracker.run(csv_path, state_path, results_path)
+            mock_scrape.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 6: Redirect to non-Google domain
+# SCENARIO 6: API domain constraint — requests stay on enrichlayer.com
 # ---------------------------------------------------------------------------
 
-class TestRedirectFromGoogle(unittest.TestCase):
-    """SCENARIO: requests must not follow a redirect to a non-Google domain."""
+class TestApiDomainConstraint(unittest.TestCase):
+    """SCENARIO: all API requests must target enrichlayer.com; LinkedIn URL is a parameter only."""
 
-    def setUp(self):
-        scraper._prev_user_agent = None
+    def test_api_call_goes_to_enrichlayer_not_linkedin(self):
+        from urllib.parse import urlparse
 
-    def test_redirect_to_non_google_domain_returns_failure(self):
-        """A response whose final URL is not google.com must return success=False."""
-        redirect_response = MagicMock()
-        redirect_response.text = "<html></html>"
-        redirect_response.raise_for_status = MagicMock()
-        redirect_response.url = "https://evil.com/phishing"
-        redirect_response.headers = {"content-type": "text/html"}
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get") as mock_get, \
+             patch("scraper.time.sleep"):
+            mock_get.return_value = _mock_api_response()
+            scraper.scrape_profile("https://linkedin.com/in/john-doe")
 
-        with patch("scraper.requests.get", return_value=redirect_response):
-            result = scraper.scrape_profile("https://linkedin.com/in/test-person")
+        called_url = mock_get.call_args[0][0]
+        netloc = urlparse(called_url).netloc
+        self.assertIn("enrichlayer.com", netloc)
 
-        self.assertFalse(result["success"])
-        self.assertIn("evil.com", result["error"])
+    def test_linkedin_url_sent_as_parameter_not_as_request_target(self):
+        """The LinkedIn URL must appear only as a query parameter, never as the fetch target."""
+        from urllib.parse import urlparse
 
-    def test_redirect_response_with_bad_status_returns_failure(self):
-        """A response that raises on raise_for_status must return success=False."""
-        redirect_response = MagicMock()
-        redirect_response.status_code = 301
-        redirect_response.text = ""
-        redirect_response.raise_for_status.side_effect = Exception("301 redirect")
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get") as mock_get, \
+             patch("scraper.time.sleep"):
+            mock_get.return_value = _mock_api_response()
+            scraper.scrape_profile("https://linkedin.com/in/john-doe")
 
-        with patch("scraper.requests.get", return_value=redirect_response):
-            result = scraper.scrape_profile("https://linkedin.com/in/test-person")
+        called_url = mock_get.call_args[0][0]
+        netloc = urlparse(called_url).netloc
+        self.assertNotIn("linkedin.com", netloc)
 
-        self.assertFalse(result["success"])
+    def test_invalid_linkedin_url_never_reaches_api(self):
+        """Path-traversal or non-LinkedIn URL must be rejected before any API call."""
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get") as mock_get, \
+             patch("scraper.time.sleep"):
+            scraper.scrape_profile("https://evil.com/in/victim")
+
+        mock_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 7: Non-HTML (binary) Google response
+# SCENARIO 7: Unexpected or malformed API responses
 # ---------------------------------------------------------------------------
 
-class TestNonHtmlGoogleResponse(unittest.TestCase):
-    """SCENARIO: binary or non-HTML response from Google must return success=False without crashing."""
+class TestApiUnexpectedResponse(unittest.TestCase):
+    """SCENARIO: malformed or unexpected API responses must not crash the scraper."""
 
-    def setUp(self):
-        scraper._prev_user_agent = None
+    def test_non_json_response_returns_failure_not_exception(self):
+        """A response whose .json() raises must return success=False, not propagate."""
+        bad_response = MagicMock()
+        bad_response.status_code = 200
+        bad_response.json.side_effect = ValueError("No JSON object could be decoded")
 
-    def test_non_html_content_type_returns_failure(self):
-        """A response with Content-Type: application/pdf must return success=False."""
-        pdf_response = MagicMock()
-        pdf_response.text = "%PDF-1.4 fake content"
-        pdf_response.raise_for_status = MagicMock()
-        pdf_response.url = "https://www.google.com/search"
-        pdf_response.headers = {"content-type": "application/pdf"}
-
-        with patch("scraper.requests.get", return_value=pdf_response):
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get", return_value=bad_response), \
+             patch("scraper.time.sleep"):
             result = scraper.scrape_profile("https://linkedin.com/in/test-person")
 
-        self.assertFalse(result["success"])
-        self.assertIn("Content-Type", result["error"])
-
-    def test_binary_content_returns_failure_not_exception(self):
-        binary_response = MagicMock()
-        # Simulate binary content decoded as text (garbled but won't crash)
-        binary_response.text = "\x00\x01\x02\x03\xff\xfe binary garbage"
-        binary_response.raise_for_status = MagicMock()
-        binary_response.url = "https://www.google.com/search"
-        binary_response.headers = {"content-type": "text/html; charset=utf-8"}
-
-        with patch("scraper.requests.get", return_value=binary_response):
-            result = scraper.scrape_profile("https://linkedin.com/in/test-person")
-
-        # Must return a dict without raising, success depends on whether any
-        # LinkedIn result was parsed from the garbage content (almost certainly not)
         self.assertIsInstance(result, dict)
-        self.assertIn("success", result)
+        self.assertFalse(result["success"])
         self.assertIn("error", result)
 
-    def test_pdf_content_type_returns_failure_not_exception(self):
-        pdf_body = "%PDF-1.4 \x00\x01\x02 fake pdf binary content"
-        pdf_response = MagicMock()
-        pdf_response.text = pdf_body
-        pdf_response.raise_for_status = MagicMock()
-        pdf_response.url = "https://www.google.com/search"
-        pdf_response.headers = {"content-type": "application/pdf"}
-
-        with patch("scraper.requests.get", return_value=pdf_response):
+    def test_5xx_error_returns_failure_not_exception(self):
+        """A 500 error must return success=False with the status code in the error."""
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get", return_value=_mock_api_response(500)), \
+             patch("scraper.time.sleep"):
             result = scraper.scrape_profile("https://linkedin.com/in/test-person")
 
         self.assertIsInstance(result, dict)
         self.assertFalse(result["success"])
+        self.assertIn("500", result["error"])
+
+    def test_network_timeout_returns_failure_not_exception(self):
+        import requests as req
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get", side_effect=req.exceptions.Timeout), \
+             patch("scraper.time.sleep"):
+            result = scraper.scrape_profile("https://linkedin.com/in/test-person")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Request timeout")
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +361,7 @@ class TestStateMissingOnFirstRun(unittest.TestCase):
     def test_missing_state_completes_without_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = os.path.join(tmpdir, "profiles.csv")
-            state_path = os.path.join(tmpdir, "state.json")   # does not exist yet
+            state_path = os.path.join(tmpdir, "state.json")
             results_path = os.path.join(tmpdir, "results.md")
 
             self.assertFalse(os.path.exists(state_path))
@@ -381,9 +371,10 @@ class TestStateMissingOnFirstRun(unittest.TestCase):
             ])
 
             def fake_scrape(url):
-                return {"success": True, "title": "Engineer", "snippet": "", "raw": "", "error": None}
+                return {"success": True, "title": "Engineer", "snippet": "", "raw": {}, "error": None}
 
-            with patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
                  patch("tracker.time.sleep"):
                 summary = tracker.run(csv_path, state_path, results_path)
 
@@ -427,9 +418,10 @@ class TestCorruptedStateJson(unittest.TestCase):
             ])
 
             def fake_scrape(url):
-                return {"success": True, "title": "Engineer", "snippet": "", "raw": "", "error": None}
+                return {"success": True, "title": "Engineer", "snippet": "", "raw": {}, "error": None}
 
-            with patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
                  patch("tracker.time.sleep"):
                 summary = tracker.run(csv_path, state_path, results_path)
 
@@ -451,7 +443,7 @@ class TestExtremelyLongName(unittest.TestCase):
     def test_long_name_truncated_in_table_cell(self):
         long_name = "A" * 10_000
         result = escape_table_cell(long_name)
-        self.assertLessEqual(len(result), 600)  # 500 chars + some escaping overhead
+        self.assertLessEqual(len(result), 600)
 
     def test_long_name_does_not_crash_results_md(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -465,45 +457,49 @@ class TestExtremelyLongName(unittest.TestCase):
             ])
 
             def fake_scrape(url):
-                return {"success": True, "title": "Engineer", "snippet": "", "raw": "", "error": None}
+                return {"success": True, "title": "Engineer", "snippet": "", "raw": {}, "error": None}
 
-            with patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
                  patch("tracker.time.sleep"):
                 tracker.run(csv_path, state_path, results_path)
 
             self.assertTrue(os.path.exists(results_path))
             content = open(results_path, encoding="utf-8").read()
-            # Results file exists and is reasonable size (not 10k chars in a single cell)
             self.assertLess(len(content), 50_000)
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 11: python-dotenv not used
+# SCENARIO 11: python-dotenv correctly configured
 # ---------------------------------------------------------------------------
 
-class TestPythonDotenvUnused(unittest.TestCase):
-    """SCENARIO: python-dotenv must not appear in requirements.txt or any source file."""
+class TestDotenvConfiguration(unittest.TestCase):
+    """SCENARIO: python-dotenv must be in requirements.txt and used in tracker.py."""
 
     def _src_dir(self):
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    def test_dotenv_not_in_requirements(self):
+    def test_dotenv_in_requirements(self):
         req_path = os.path.join(self._src_dir(), "requirements.txt")
         with open(req_path, encoding="utf-8") as f:
             content = f.read()
-        self.assertNotIn("dotenv", content.lower(),
-                         "python-dotenv must not be in requirements.txt")
+        self.assertIn("python-dotenv", content.lower(),
+                      "python-dotenv must be in requirements.txt")
 
-    def test_dotenv_not_imported_in_source(self):
-        src_dir = self._src_dir()
-        for filename in ["tracker.py", "scraper.py", "utils.py", "detector.py"]:
-            filepath = os.path.join(src_dir, filename)
-            if not os.path.exists(filepath):
-                continue
-            with open(filepath, encoding="utf-8") as f:
-                src = f.read()
-            self.assertNotIn("dotenv", src,
-                             f"dotenv found imported in {filename}")
+    def test_dotenv_imported_in_tracker(self):
+        with open(os.path.join(self._src_dir(), "tracker.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("dotenv", src, "tracker.py must import/use dotenv")
+
+    def test_env_example_contains_enrichlayer_api_key(self):
+        env_example = os.path.join(self._src_dir(), ".env.example")
+        with open(env_example, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("ENRICHLAYER_API_KEY", content)
+
+    def test_env_example_file_exists(self):
+        env_example = os.path.join(self._src_dir(), ".env.example")
+        self.assertTrue(os.path.exists(env_example), ".env.example must exist")
 
 
 # ---------------------------------------------------------------------------
@@ -543,9 +539,10 @@ class TestResultsMdWithNoProfiles(unittest.TestCase):
             with open(csv_path, "w") as f:
                 f.write("name,linkedin_url,notes\n")
 
-            with patch("tracker.scraper.scrape_profile"):
-                with patch("tracker.time.sleep"):
-                    summary = tracker.run(csv_path, state_path, results_path)
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile"), \
+                 patch("tracker.time.sleep"):
+                summary = tracker.run(csv_path, state_path, results_path)
 
             self.assertIn("Run complete", summary)
             self.assertTrue(os.path.exists(results_path))

@@ -10,13 +10,18 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv  # SECURITY: load .env before any env var reads
+
 import scraper
 import detector
 from utils import escape_table_cell, sanitize_for_log, sanitize_string
+
+load_dotenv()  # load .env file at module startup — safe no-op if file is absent
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -397,6 +402,15 @@ def run(
     Returns:
         Summary string printed to stdout.
     """
+    # SECURITY: verify API key is present before doing any work
+    if not os.environ.get("ENRICHLAYER_API_KEY"):  # SECURITY: env var only
+        print(
+            "Error: ENRICHLAYER_API_KEY not set.\n"
+            "Copy .env.example to .env and add your key.\n"
+            "Get your key at enrichlayer.com"
+        )
+        sys.exit(1)
+
     run_time = _now_utc()
     profiles = load_profiles(profiles_file)
     state = load_state(state_file)
