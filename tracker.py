@@ -2,7 +2,7 @@
 Tracker module for stealth-watch — main orchestrator.
 
 Responsibility: load profiles, run scrape + detection for each, update state,
-write results.md, and print a summary. Entry point for the GitHub Actions workflow.
+write results.md, and print a summary.
 """
 
 import csv
@@ -356,7 +356,7 @@ def generate_results_md(
     lines += [
         "",
         "---",
-        f"*[stealth-watch]({REPO_URL}) — runs free on GitHub Actions*",
+        f"*[stealth-watch]({REPO_URL})*",
     ]
 
     with open(results_file, "w", encoding="utf-8") as f:

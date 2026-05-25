@@ -2,7 +2,7 @@
 
 # stealth-watch
 
-Track when LinkedIn people go stealth or change positions. VC deal scourcing. Runs free on GitHub Actions. No API keys. No servers.
+Track when LinkedIn people go stealth or change positions. No API keys. No servers.
 
 ---
 
@@ -11,21 +11,15 @@ Track when LinkedIn people go stealth or change positions. VC deal scourcing. Ru
 - Reads a list of LinkedIn profiles from `profiles.csv`
 - Queries Google for each profile's current title and snippet (never touches LinkedIn directly)
 - Flags changes that match stealth startup patterns: founder keywords, blank titles after senior roles, etc.
-- Writes findings to `results.md` and commits them automatically every 48 hours
+- Writes findings to `results.md`
 
 ---
 
-## Quick start
+## How to run
 
-1. **Fork** this repo
-2. **Edit** `profiles.csv` — add the people you want to watch
-3. **Done** — GitHub Actions runs every 48 hours and updates `results.md`
-
-To trigger a run immediately: Actions → Stealth Watch → Run workflow.
-
----
-
-## Run locally
+**Run on your own machine** — Google blocks datacenter IPs (including GitHub Actions / Azure) so
+automated cloud runners won't work. Run `python tracker.py` locally and `results.md` will be
+updated on your machine.
 
 ```bash
 pip install -r requirements.txt
@@ -33,6 +27,27 @@ python tracker.py
 ```
 
 Results are written to `results.md` and `state.json`.
+
+---
+
+## Automate it locally
+
+Set up a cron job to run every 48 hours automatically.
+
+**Mac / Linux** — open your crontab:
+
+```bash
+crontab -e
+```
+
+Add this line (adjust the path):
+
+```
+0 9 */2 * * cd /path/to/linkedin-stealth && python tracker.py
+```
+
+**Windows** — use Task Scheduler to run `python tracker.py` from the repo directory on a
+48-hour schedule.
 
 ---
 
@@ -82,9 +97,8 @@ Do not commit it to a public fork.
 
 > **Warning — `state.json` contains your watchlist data.**
 > It stores every person's name, job title history, and change timestamps.
-> It is excluded from git via `.gitignore` and persisted only in GitHub Actions
-> cache between runs. **Never commit `state.json` to a public repository.**
-> If you run locally, keep `state.json` out of version control.
+> It is excluded from git via `.gitignore`.
+> **Never commit `state.json` to a public repository.**
 
 ---
 
