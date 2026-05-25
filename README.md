@@ -74,6 +74,7 @@ A profile is flagged as **STEALTH** if any of the following is true:
 ## results.md example
 
 ```
+---
 # Stealth Watch
 *Last run: 2026-05-25 09:00 UTC — 50 profiles monitored*
 
