@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 import detector
 import tracker
 
+FAKE_API_KEY = "test_tracker_key_xyz"
+
 
 def _write_csv(path: str, rows: list, header=("name", "linkedin_url", "notes")):
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -203,9 +205,10 @@ class TestRunOrchestration(unittest.TestCase):
             state_path = os.path.join(tmpdir, "state.json")
             results_path = os.path.join(tmpdir, "results.md")
 
-            with patch("tracker.scraper.scrape_profile", return_value=_ok_scrape()):
-                with patch("tracker.time.sleep"):
-                    summary = tracker.run(csv_path, state_path, results_path)
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", return_value=_ok_scrape()), \
+                 patch("tracker.time.sleep"):
+                summary = tracker.run(csv_path, state_path, results_path)
 
             self.assertIn("Run complete", summary)
             self.assertTrue(os.path.exists(results_path))
@@ -218,9 +221,10 @@ class TestRunOrchestration(unittest.TestCase):
             state_path = os.path.join(tmpdir, "state.json")
             results_path = os.path.join(tmpdir, "results.md")
 
-            with patch("tracker.scraper.scrape_profile", return_value=_fail_scrape()):
-                with patch("tracker.time.sleep"):
-                    tracker.run(csv_path, state_path, results_path)
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", return_value=_fail_scrape()), \
+                 patch("tracker.time.sleep"):
+                tracker.run(csv_path, state_path, results_path)
 
             self.assertTrue(os.path.exists(results_path))
             with open(results_path, encoding="utf-8") as f:

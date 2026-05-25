@@ -2,32 +2,53 @@
 
 # stealth-watch
 
-Track when senior people go stealth. Runs free on GitHub Actions. No API keys. No servers.
+LinkedIn job change tracker for VC deal sourcing. Runs automatically every 2 weeks via GitHub Actions.
+
+---
+
+## Requirements
+
+Requires an Enrichlayer API key (~$4/month for 200 profiles checked twice a month).
+Get yours at [enrichlayer.com](https://enrichlayer.com).
+
+Enrichlayer gives free credits on signup to cover your first month.
+
+---
+
+## Setup
+
+1. **Fork** this repo
+2. **Get an API key** at [enrichlayer.com](https://enrichlayer.com)
+3. **Add it to GitHub repo secrets** as `ENRICHLAYER_API_KEY`
+   (Settings → Secrets and variables → Actions → New secret)
+4. **Edit** `profiles.csv` with the people you want to track
+5. **GitHub Actions runs automatically** on the 1st and 15th of every month
+6. **Check `results.md`** for findings
 
 ---
 
 ## How it works
 
 - Reads a list of LinkedIn profiles from `profiles.csv`
-- Queries Google for each profile's current title and snippet (never touches LinkedIn directly)
+- Calls the Enrichlayer API for each profile's current occupation and headline
 - Flags changes that match stealth startup patterns: founder keywords, blank titles after senior roles, etc.
-- Writes findings to `results.md` and commits them automatically every 48 hours
+- Writes findings to `results.md` and commits automatically
 
 ---
 
-## Quick start
+## Cost
 
-1. **Fork** this repo
-2. **Edit** `profiles.csv` — add the people you want to watch
-3. **Done** — GitHub Actions runs every 48 hours and updates `results.md`
+200 profiles × 2 runs/month × $0.01 = **~$4/month**
 
-To trigger a run immediately: Actions → Stealth Watch → Run workflow.
+Enrichlayer gives free credits on signup to cover your first month.
 
 ---
 
 ## Run locally
 
 ```bash
+cp .env.example .env
+# Add your ENRICHLAYER_API_KEY to .env
 pip install -r requirements.txt
 python tracker.py
 ```
@@ -76,9 +97,13 @@ A profile is flagged as **STEALTH** if any of the following is true:
 
 ## Privacy note
 
-stealth-watch reads **public** Google search cache of **public** LinkedIn data.
 Keep your `profiles.csv` private — it reveals who you are watching.
 Do not commit it to a public fork.
+
+> **Warning — `state.json` contains your watchlist data.**
+> It stores every person's name, job title history, and change timestamps.
+> It is excluded from git via `.gitignore`.
+> **Never commit `state.json` to a public repository.**
 
 ---
 
