@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import scraper
 import detector
-from utils import sanitize_for_log, sanitize_string
+from utils import escape_table_cell, sanitize_for_log, sanitize_string
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,17 +35,26 @@ REPO_URL = "https://github.com/yigitmeteozcan/stealth-watch"
 LINKEDIN_URL_PREFIX = "https://linkedin.com/in/"
 LINKEDIN_ALT_PREFIX = "https://www.linkedin.com/in/"
 
+# SECURITY: whitespace characters that must not appear inside a LinkedIn URL
+_URL_WHITESPACE = frozenset(" \t\n\r\f\v")
+
 
 def _is_valid_linkedin_url(url: str) -> bool:
     """
-    Return True only if url is a well-formed LinkedIn profile URL.
+    Return True only if url is a well-formed LinkedIn profile URL with no
+    embedded whitespace.
 
     Args:
-        url: Candidate URL string.
+        url: Candidate URL string (already stripped of leading/trailing space).
 
     Returns:
-        True if url begins with a linkedin.com/in/ prefix.
+        True if url begins with a linkedin.com/in/ prefix and contains no
+        whitespace characters.
     """
+    # SECURITY: reject URLs with embedded whitespace — they pass startswith() but
+    # could produce unexpected slugs or corrupt the Google query string
+    if any(c in url for c in _URL_WHITESPACE):
+        return False
     # SECURITY: strict prefix check prevents requests to arbitrary domains
     return url.startswith(LINKEDIN_URL_PREFIX) or url.startswith(LINKEDIN_ALT_PREFIX)
 
@@ -54,8 +63,9 @@ def load_profiles(profiles_file: str = PROFILES_FILE) -> List[Dict]:
     """
     Load and validate profiles from a CSV file.
 
-    Skips rows missing a name or linkedin_url, and rows whose linkedin_url is
-    not a valid LinkedIn profile URL. Logs a warning for each skipped row.
+    Skips rows missing a name or linkedin_url, rows whose linkedin_url is
+    not a valid LinkedIn profile URL, and rows with whitespace in the URL.
+    Logs a warning for each skipped row.
 
     Args:
         profiles_file: Path to the CSV file.
@@ -81,11 +91,12 @@ def load_profiles(profiles_file: str = PROFILES_FILE) -> List[Dict]:
                         i, sanitize_for_log(name),
                     )
                     continue
-                # SECURITY: validate URL before it touches the scraper
+                # SECURITY: validate URL before it touches the scraper;
+                # also catches URLs with embedded whitespace/newlines
                 if not _is_valid_linkedin_url(url):
                     logger.warning(
-                        "Row %d skipped: invalid linkedin_url %r (name=%s)",
-                        i, url, sanitize_for_log(name),
+                        "Row %d skipped: invalid linkedin_url (name=%s)",
+                        i, sanitize_for_log(name),
                     )
                     continue
 
@@ -104,7 +115,7 @@ def load_state(state_file: str = STATE_FILE) -> Dict:
     Load the persisted state from a JSON file.
 
     Returns an empty dict if the file is missing or contains invalid JSON,
-    so a corrupted state.json never crashes the run.
+    so a corrupted or absent state.json never crashes the run.
 
     Args:
         state_file: Path to the state JSON file.
@@ -131,15 +142,17 @@ def load_state(state_file: str = STATE_FILE) -> Dict:
 
 def save_state(state: Dict, state_file: str = STATE_FILE) -> None:
     """
-    Atomically write state to disk: write to a .tmp file, then rename.
+    Atomically write state to disk: write to a .tmp file in the same directory,
+    then rename over the target.
 
-    The rename is atomic on POSIX systems, so state.json is never left in a
-    partially-written state even if the process is killed mid-write.
+    The .tmp file is created beside state_file (same directory, same filesystem)
+    so that os.rename() is a true atomic operation on POSIX systems.
 
     Args:
         state: Full state dict to persist.
         state_file: Destination path for state.json.
     """
+    # SECURITY: write to sibling .tmp in same dir so rename is same-filesystem atomic
     tmp_file = state_file + ".tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
@@ -198,8 +211,10 @@ def _update_state_entry(
 
 
 def _fmt_title(title: str) -> str:
-    """Return '[blank]' for empty/whitespace titles, otherwise the title itself."""
-    return title.strip() if title.strip() else "[blank]"
+    """Return '[blank]' for empty/whitespace titles, otherwise the escaped title."""
+    stripped = title.strip()
+    # SECURITY: escape for table cell so even "[blank]" placeholder is safe
+    return escape_table_cell(stripped) if stripped else "[blank]"
 
 
 def _fmt_date(iso_str: str) -> str:
@@ -216,7 +231,8 @@ def generate_results_md(
     """
     Write results.md summarising the latest tracking run.
 
-    Sections: Stealth Signals, Recent Job Changes, Active & Unchanged, Failed Scrapes.
+    All user-controlled values (name, notes, titles) are escaped via
+    escape_table_cell() before being written into markdown table cells.
 
     Args:
         state: Full state dict after the run.
@@ -258,12 +274,13 @@ def generate_results_md(
             "|------|-----|-----|------------|----------|----------|-------|",
         ]
         for entry, det in stealth:
-            name = sanitize_string(entry["name"])
+            # SECURITY: escape all user-controlled fields before writing to table
+            name = escape_table_cell(entry["name"])
             was = _fmt_title(det.get("previous_title", ""))
             now_title = _fmt_title(det.get("current_title", ""))
-            conf = det.get("confidence", "")
+            conf = escape_table_cell(det.get("confidence", ""))
             url = entry["linkedin_url"]
-            notes = sanitize_string(entry.get("notes", ""))
+            notes = escape_table_cell(entry.get("notes", ""))
             lines.append(
                 f"| {name} | {was} | {now_title} | {conf} | [profile]({url}) | {run_date} | {notes} |"
             )
@@ -281,7 +298,8 @@ def generate_results_md(
             "|------|-----|-----|----------|-------|",
         ]
         for entry, det in job_changes:
-            name = sanitize_string(entry["name"])
+            # SECURITY: escape all user-controlled fields before writing to table
+            name = escape_table_cell(entry["name"])
             was = _fmt_title(det.get("previous_title", ""))
             now_title = _fmt_title(det.get("current_title", ""))
             url = entry["linkedin_url"]
@@ -305,8 +323,9 @@ def generate_results_md(
             "|------|--------|----------|",
         ]
         for entry, det in failed:
-            name = sanitize_string(entry["name"])
-            reason = sanitize_string(det.get("reason", "unknown"))
+            # SECURITY: escape all user-controlled fields before writing to table
+            name = escape_table_cell(entry["name"])
+            reason = escape_table_cell(det.get("reason", "unknown"))
             url = entry["linkedin_url"]
             lines.append(f"| {name} | {reason} | [profile]({url}) |")
     else:

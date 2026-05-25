@@ -4,6 +4,9 @@ Scraper module for stealth-watch.
 Responsibility: given a LinkedIn profile URL, return the person's current title
 and snippet from Google search results. NEVER touches LinkedIn directly — only
 queries Google's public search index.
+
+Threading note: tracker.py is single-threaded by design; the module-level
+_prev_user_agent state is intentionally not protected by a lock.
 """
 
 import logging
@@ -26,23 +29,26 @@ REQUEST_TIMEOUT: int = 15  # seconds — SECURITY: enforced on every requests.ge
 CAPTCHA_SIGNAL: str = "detected unusual traffic"
 GOOGLE_SEARCH_URL: str = "https://www.google.com/search"
 
-# SECURITY: 10 real browser UA strings; Python/requests default UA is never used
+# SECURITY: 10 current browser UA strings (updated 2025-2026); Python/requests
+# default UA is never used. Single-threaded use only — see module docstring.
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 OPR/120.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
 ]
 
 # SECURITY: slug must contain only URL-safe identifier characters
 _SLUG_PATTERN = re.compile(r"^[a-zA-Z0-9\-\_]+$")
 
+# SECURITY: single-threaded use only (tracker.py processes profiles sequentially)
+# This global is intentionally not protected by a lock.
 _prev_user_agent: Optional[str] = None
 
 
@@ -79,7 +85,8 @@ def extract_slug(linkedin_url: str) -> str:
 
     slug = parts[1]
 
-    # SECURITY: whitelist-validate slug characters before using in a Google query
+    # SECURITY: whitelist-validate slug characters before using in a Google query;
+    # blocks header-injection attempts like "slug\nHost: evil.com"
     if not _SLUG_PATTERN.match(slug):
         raise ValueError(f"Unsafe characters in LinkedIn slug: {slug!r}")
 
@@ -238,7 +245,8 @@ def scrape_profile(linkedin_url: str) -> Dict:
         response = requests.get(
             search_url,
             headers=_build_headers(),
-            timeout=REQUEST_TIMEOUT,  # SECURITY: always enforce — never hang forever
+            timeout=REQUEST_TIMEOUT,      # SECURITY: always enforce — never hang forever
+            allow_redirects=False,        # SECURITY: never follow redirect to non-Google domain
         )
         response.raise_for_status()
 

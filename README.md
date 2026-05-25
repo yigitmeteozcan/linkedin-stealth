@@ -80,6 +80,12 @@ stealth-watch reads **public** Google search cache of **public** LinkedIn data.
 Keep your `profiles.csv` private — it reveals who you are watching.
 Do not commit it to a public fork.
 
+> **Warning — `state.json` contains your watchlist data.**
+> It stores every person's name, job title history, and change timestamps.
+> It is excluded from git via `.gitignore` and persisted only in GitHub Actions
+> cache between runs. **Never commit `state.json` to a public repository.**
+> If you run locally, keep `state.json` out of version control.
+
 ---
 
 ## Run tests
