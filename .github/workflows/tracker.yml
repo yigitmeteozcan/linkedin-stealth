@@ -38,23 +38,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore state cache
-        uses: actions/cache@v4
-        with:
-          path: state.json
-          # Keyed on branch so forks never share state across branches
-          key: stealth-state-${{ github.ref_name }}
-
       - name: Run tracker
         env:
           ENRICHLAYER_API_KEY: ${{ secrets.ENRICHLAYER_API_KEY }}
         run: python tracker.py
-
-      - name: Save state cache
-        uses: actions/cache/save@v4
-        with:
-          path: state.json
-          key: stealth-state-${{ github.ref_name }}
 
       - name: Commit results
         run: |
