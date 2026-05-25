@@ -95,8 +95,14 @@ A profile is flagged as **STEALTH** if any of the following is true:
 
 ---
 
-## Privacy note
+## Security
 
+### API key
+- The key is stored in `.env` (excluded from git via `.gitignore`) and read at runtime from `ENRICHLAYER_API_KEY`.
+- **Never commit `.env` to git.** Running the tracker will warn you if git is tracking `.env`.
+- GitHub users: enable **secret scanning** (Settings → Code security → Secret scanning) to get alerts if a key is accidentally pushed.
+
+### Privacy
 Keep your `profiles.csv` private — it reveals who you are watching.
 Do not commit it to a public fork.
 

@@ -15,6 +15,9 @@ _UNSAFE_CHARS = re.compile(r"[^a-zA-Z0-9 \-\_\.\,\@]")
 # SECURITY: characters that break GitHub-Flavoured Markdown table cells
 _TABLE_UNSAFE = re.compile(r"[\n\r\t]")
 
+# SECURITY: strip HTML tags to prevent XSS if output is rendered as HTML/markdown
+_HTML_TAG = re.compile(r"<[^>]+>")
+
 
 def sanitize_string(value: str) -> str:
     """
@@ -71,6 +74,8 @@ def escape_table_cell(value: str) -> str:
     """
     # SECURITY: escape | so user-controlled data cannot break table structure
     safe = sanitize_string(value)
+    # SECURITY: strip HTML tags to prevent XSS when markdown is rendered in a browser
+    safe = _HTML_TAG.sub("", safe)
     # SECURITY: replace control whitespace to prevent row splitting
     safe = _TABLE_UNSAFE.sub(" ", safe)
     # SECURITY: escape pipe to prevent column injection in markdown tables

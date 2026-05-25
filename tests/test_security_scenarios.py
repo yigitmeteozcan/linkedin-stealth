@@ -7,6 +7,7 @@ production hardening audit. All tests use Python's built-in unittest only.
 
 import csv
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -554,6 +555,474 @@ class TestResultsMdWithNoProfiles(unittest.TestCase):
             self.assertIn("Stealth Signals", content)
             self.assertIn("Active & Unchanged", content)
             self.assertIn("Failed Scrapes", content)
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 12: API key never appears in log output
+# ---------------------------------------------------------------------------
+
+class TestApiKeyNeverLogged(unittest.TestCase):
+    """SECURITY: API key must never appear in any log message."""
+
+    def _capture_scraper_logs(self, log_fn):
+        """Run log_fn with a log capture handler attached to the scraper logger."""
+        captured = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                captured.append(self.format(record))
+
+        handler = _Capture()
+        scraper_logger = logging.getLogger("scraper")
+        scraper_logger.addHandler(handler)
+        scraper_logger.setLevel(logging.DEBUG)
+        try:
+            log_fn()
+        finally:
+            scraper_logger.removeHandler(handler)
+        return captured
+
+    def test_401_log_does_not_contain_api_key(self):
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            mock_resp = MagicMock()
+            mock_resp.status_code = 401
+
+            def run():
+                with patch("scraper.requests.get", return_value=mock_resp):
+                    scraper.scrape_profile("https://linkedin.com/in/test")
+
+            logs = self._capture_scraper_logs(run)
+        for msg in logs:
+            self.assertNotIn(FAKE_API_KEY, msg, f"API key leaked in log: {msg!r}")
+
+    def test_429_retry_log_does_not_contain_api_key(self):
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp_429 = MagicMock()
+            resp_429.status_code = 429
+            resp_ok = MagicMock()
+            resp_ok.status_code = 200
+            resp_ok.json.return_value = {"occupation": "Engineer", "headline": ""}
+
+            def run():
+                with patch("scraper.requests.get", side_effect=[resp_429, resp_ok]):
+                    scraper.scrape_profile("https://linkedin.com/in/test")
+
+            logs = self._capture_scraper_logs(run)
+        for msg in logs:
+            self.assertNotIn(FAKE_API_KEY, msg, f"API key leaked in log: {msg!r}")
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 13: API key redacted from exception messages
+# ---------------------------------------------------------------------------
+
+class TestApiKeyRedactedFromErrors(unittest.TestCase):
+    """SECURITY: if the API key appears in an exception message, it must be replaced with [REDACTED]."""
+
+    def test_key_in_exception_message_is_redacted(self):
+        import requests as req
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            exc = req.exceptions.RequestException(
+                f"Connection reset — token {FAKE_API_KEY} was rejected"
+            )
+            with patch("scraper.requests.get", side_effect=exc):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertFalse(result["success"])
+        self.assertNotIn(FAKE_API_KEY, result["error"])
+        self.assertIn("[REDACTED]", result["error"])
+
+    def test_key_not_in_any_result_field_on_401(self):
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp = MagicMock()
+            resp.status_code = 401
+            with patch("scraper.requests.get", return_value=resp):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertNotIn(FAKE_API_KEY, str(result))
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 14: Malicious occupation field — markdown injection in results.md
+# ---------------------------------------------------------------------------
+
+class TestMaliciousOccupationInResultsMd(unittest.TestCase):
+    """SECURITY: pipe characters in occupation must not break the markdown table."""
+
+    def test_pipe_in_occupation_escaped_in_results(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "profiles.csv")
+            state_path = os.path.join(tmpdir, "state.json")
+            results_path = os.path.join(tmpdir, "results.md")
+
+            _write_csv(csv_path, [
+                {"name": "Alice", "linkedin_url": "https://linkedin.com/in/alice", "notes": ""},
+            ])
+
+            malicious_title = "Founder | DROP TABLE | hack"
+
+            def fake_scrape(url):
+                return {
+                    "success": True, "title": malicious_title,
+                    "snippet": "", "raw": {}, "error": None,
+                }
+
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+                 patch("tracker.time.sleep"):
+                tracker.run(csv_path, state_path, results_path)
+
+            with open(results_path, encoding="utf-8") as f:
+                content = f.read()
+
+            self.assertIn("Stealth Watch", content)
+            for line in content.splitlines():
+                if "Alice" in line and line.startswith("|"):
+                    unescaped = line.replace(r"\|", "")
+                    self.assertNotIn("DROP TABLE", unescaped.split("|")[2] if "|" in unescaped else "")
+
+    def test_html_injection_in_occupation_sanitized(self):
+        """HTML tags in occupation must not appear raw in results.md output."""
+        from utils import escape_table_cell
+        html_occupation = "<script>alert(1)</script>Engineer"
+        sanitized = escape_table_cell(html_occupation)
+        self.assertNotIn("<script>", sanitized)
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 15: None occupation from API → title = ""
+# ---------------------------------------------------------------------------
+
+class TestNoneOccupationHandling(unittest.TestCase):
+    """SECURITY: API returning null/None for occupation must yield title='' not crash."""
+
+    def test_none_occupation_returns_empty_title(self):
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"occupation": None, "headline": "Some headline"}
+            with patch("scraper.requests.get", return_value=resp):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["title"], "")
+        self.assertIsNotNone(result["title"])
+
+    def test_missing_occupation_key_returns_empty_title(self):
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"headline": "Building in stealth"}
+            with patch("scraper.requests.get", return_value=resp):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["title"], "")
+
+    def test_non_string_occupation_returns_empty_title(self):
+        """Occupation value of unexpected type (int) must yield empty string, not crash."""
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"occupation": 12345, "headline": ""}
+            with patch("scraper.requests.get", return_value=resp):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertTrue(result["success"])
+        self.assertIsInstance(result["title"], str)
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 16: 429 retry — verifies sleep(RETRY_WAIT) and eventual success
+# ---------------------------------------------------------------------------
+
+class TestRateLimitRetry(unittest.TestCase):
+    """SECURITY/RELIABILITY: 429 must trigger exactly RETRY_WAIT sleep then succeed."""
+
+    def test_retry_wait_duration_correct(self):
+        import scraper as sc
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.json.return_value = {"occupation": "Engineer", "headline": ""}
+
+        sleep_calls = []
+
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get", side_effect=[resp_429, resp_ok]), \
+             patch("scraper.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+            result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertTrue(result["success"])
+        self.assertIn(sc.RETRY_WAIT, sleep_calls)
+
+    def test_double_429_returns_rate_limited_error(self):
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get", return_value=resp_429), \
+             patch("scraper.time.sleep"):
+            result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Rate limited")
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 17: 402 out of credits — warning logged
+# ---------------------------------------------------------------------------
+
+class TestOutOfCreditsWarning(unittest.TestCase):
+    """RELIABILITY: 402 must return out-of-credits error and emit a WARNING log."""
+
+    def test_402_returns_out_of_credits(self):
+        resp = MagicMock()
+        resp.status_code = 402
+
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.requests.get", return_value=resp), \
+             patch("scraper.time.sleep"):
+            result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Out of credits")
+
+    def test_402_emits_warning_log(self):
+        captured = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    captured.append(record.getMessage())
+
+        handler = _Capture()
+        scraper_logger = logging.getLogger("scraper")
+        scraper_logger.addHandler(handler)
+        scraper_logger.setLevel(logging.DEBUG)
+
+        try:
+            resp = MagicMock()
+            resp.status_code = 402
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("scraper.requests.get", return_value=resp), \
+                 patch("scraper.time.sleep"):
+                scraper.scrape_profile("https://linkedin.com/in/test")
+        finally:
+            scraper_logger.removeHandler(handler)
+
+        self.assertTrue(any("credit" in m.lower() for m in captured),
+                        f"Expected a credits warning; got: {captured}")
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 18: .env tracked by git emits WARNING
+# ---------------------------------------------------------------------------
+
+class TestDotEnvTrackedByGitWarning(unittest.TestCase):
+    """SECURITY: if .env is tracked by git, tracker.run() must emit a WARNING."""
+
+    def test_env_tracked_by_git_warns(self):
+        captured = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    captured.append(record.getMessage())
+
+        handler = _Capture()
+        tracker_logger = logging.getLogger("tracker")
+        tracker_logger.addHandler(handler)
+        tracker_logger.setLevel(logging.DEBUG)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                csv_path = os.path.join(tmpdir, "profiles.csv")
+                state_path = os.path.join(tmpdir, "state.json")
+                results_path = os.path.join(tmpdir, "results.md")
+
+                with open(csv_path, "w") as f:
+                    f.write("name,linkedin_url,notes\n")
+
+                # Simulate git ls-files returning ".env" (i.e. .env is tracked)
+                mock_result = MagicMock()
+                mock_result.stdout = ".env\n"
+
+                with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                     patch("tracker.subprocess.run", return_value=mock_result), \
+                     patch("tracker.scraper.scrape_profile"), \
+                     patch("tracker.time.sleep"):
+                    tracker.run(csv_path, state_path, results_path)
+        finally:
+            tracker_logger.removeHandler(handler)
+
+        self.assertTrue(
+            any(".env" in m and "git" in m.lower() for m in captured),
+            f"Expected .env git tracking warning; got: {captured}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 19: Oversized API response fields are truncated
+# ---------------------------------------------------------------------------
+
+class TestOversizedApiResponseTruncated(unittest.TestCase):
+    """SECURITY: occupation/headline longer than MAX_STRING_LENGTH must be truncated."""
+
+    def test_oversized_occupation_truncated(self):
+        from utils import MAX_STRING_LENGTH
+        huge_title = "A" * 10_000
+
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"occupation": huge_title, "headline": ""}
+            with patch("scraper.requests.get", return_value=resp):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertTrue(result["success"])
+        self.assertLessEqual(len(result["title"]), MAX_STRING_LENGTH)
+
+    def test_oversized_headline_truncated(self):
+        from utils import MAX_STRING_LENGTH
+        huge_snippet = "B" * 10_000
+
+        with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+             patch("scraper.time.sleep"):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"occupation": "", "headline": huge_snippet}
+            with patch("scraper.requests.get", return_value=resp):
+                result = scraper.scrape_profile("https://linkedin.com/in/test")
+
+        self.assertTrue(result["success"])
+        self.assertLessEqual(len(result["snippet"]), MAX_STRING_LENGTH)
+
+
+# ---------------------------------------------------------------------------
+# NEW SCENARIO 20: 10,001-row CSV → warns and caps at MAX_PROFILES
+# ---------------------------------------------------------------------------
+
+class TestProfilesCsvCappedAtMax(unittest.TestCase):
+    """SECURITY: CSV with more than MAX_PROFILES rows must warn and only load MAX_PROFILES."""
+
+    def test_10001_rows_capped_at_max_profiles(self):
+        import tracker as tr
+        cap = tr.MAX_PROFILES
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8"
+        ) as f:
+            writer = csv.DictWriter(f, fieldnames=["name", "linkedin_url", "notes"])
+            writer.writeheader()
+            for i in range(cap + 1):
+                writer.writerow({
+                    "name": f"Person {i}",
+                    "linkedin_url": f"https://linkedin.com/in/person-{i}",
+                    "notes": "",
+                })
+            path = f.name
+
+        try:
+            profiles = tracker.load_profiles(path)
+            self.assertEqual(len(profiles), cap)
+        finally:
+            os.unlink(path)
+
+    def test_10001_rows_emits_warning(self):
+        import tracker as tr
+        cap = tr.MAX_PROFILES
+        captured = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    captured.append(record.getMessage())
+
+        handler = _Capture()
+        tracker_logger = logging.getLogger("tracker")
+        tracker_logger.addHandler(handler)
+        tracker_logger.setLevel(logging.DEBUG)
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".csv", delete=False, encoding="utf-8"
+            ) as f:
+                writer = csv.DictWriter(f, fieldnames=["name", "linkedin_url", "notes"])
+                writer.writeheader()
+                for i in range(cap + 1):
+                    writer.writerow({
+                        "name": f"Person {i}",
+                        "linkedin_url": f"https://linkedin.com/in/person-{i}",
+                        "notes": "",
+                    })
+                path = f.name
+
+            tracker.load_profiles(path)
+        finally:
+            tracker_logger.removeHandler(handler)
+            os.unlink(path)
+
+        self.assertTrue(
+            any(str(cap) in m for m in captured),
+            f"Expected MAX_PROFILES warning; got: {captured}"
+        )
+
+    def test_exact_max_profiles_loads_all(self):
+        """Exactly MAX_PROFILES rows must all load without warning."""
+        import tracker as tr
+        cap = tr.MAX_PROFILES
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8"
+        ) as f:
+            writer = csv.DictWriter(f, fieldnames=["name", "linkedin_url", "notes"])
+            writer.writeheader()
+            for i in range(cap):
+                writer.writerow({
+                    "name": f"Person {i}",
+                    "linkedin_url": f"https://linkedin.com/in/person-{i}",
+                    "notes": "",
+                })
+            path = f.name
+
+        try:
+            profiles = tracker.load_profiles(path)
+            self.assertEqual(len(profiles), cap)
+        finally:
+            os.unlink(path)
+
+    def test_non_string_occupation_returns_empty_title_in_tracker(self):
+        """Regression: scraper returning non-string title must not crash tracker."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "profiles.csv")
+            state_path = os.path.join(tmpdir, "state.json")
+            results_path = os.path.join(tmpdir, "results.md")
+
+            _write_csv(csv_path, [
+                {"name": "Alice", "linkedin_url": "https://linkedin.com/in/alice", "notes": ""},
+            ])
+
+            def fake_scrape(url):
+                return {
+                    "success": True, "title": "", "snippet": "", "raw": {}, "error": None,
+                }
+
+            with patch.dict(os.environ, {"ENRICHLAYER_API_KEY": FAKE_API_KEY}), \
+                 patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+                 patch("tracker.time.sleep"):
+                summary = tracker.run(csv_path, state_path, results_path)
+
+            self.assertIn("Run complete", summary)
 
 
 if __name__ == "__main__":

@@ -10,16 +10,17 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv  # SECURITY: load .env before any env var reads
 
 import scraper
 import detector
-from utils import escape_table_cell, sanitize_for_log, sanitize_string
+from utils import escape_table_cell, sanitize_for_log
 
 load_dotenv()  # load .env file at module startup — safe no-op if file is absent
 
@@ -31,8 +32,7 @@ STATE_FILE = "state.json"
 RESULTS_FILE = "results.md"
 
 MAX_HISTORY_ENTRIES = 10
-REQUEST_DELAY_MIN = 8.0   # seconds
-REQUEST_DELAY_MAX = 20.0  # seconds
+MAX_PROFILES = 10_000  # guard against runaway CSV files
 
 REPO_URL = "https://github.com/yigitmeteozcan/stealth-watch"
 
@@ -94,6 +94,11 @@ def load_profiles(profiles_file: str = PROFILES_FILE) -> List[Dict]:
         with open(profiles_file, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for i, row in enumerate(reader, start=2):  # row 1 is header
+                if len(profiles) >= MAX_PROFILES:
+                    logger.warning(
+                        "profiles.csv exceeds %d rows — ignoring remaining rows", MAX_PROFILES
+                    )
+                    break
                 name = (row.get("name") or "").strip()
                 url = (row.get("linkedin_url") or "").strip()
                 notes = (row.get("notes") or "").strip()
@@ -402,11 +407,25 @@ def run(
     Returns:
         Summary string printed to stdout.
     """
+    # SECURITY: warn if .env is tracked by git — key could be committed accidentally
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", ".env"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.stdout.strip():
+            logger.warning(
+                "SECURITY: .env is tracked by git — your API key may be exposed in the repo. "
+                "Run: git rm --cached .env"
+            )
+    except Exception:  # noqa: BLE001 — non-fatal; git may not be available
+        pass
+
     # SECURITY: verify API key is present before doing any work
     if not os.environ.get("ENRICHLAYER_API_KEY"):  # SECURITY: env var only
-        print(
-            "Error: ENRICHLAYER_API_KEY not set.\n"
-            "Copy .env.example to .env and add your key.\n"
+        logger.error(
+            "ENRICHLAYER_API_KEY not set. "
+            "Copy .env.example to .env and add your key. "
             "Get your key at enrichlayer.com"
         )
         sys.exit(1)
@@ -427,8 +446,8 @@ def run(
         _update_state_entry(state, profile, scrape_result, detection)
 
         if i < len(profiles) - 1:
-            delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
-            time.sleep(delay)
+            # Small courtesy delay between profiles; the scraper adds its own per-request delay
+            time.sleep(random.uniform(0.5, 1.5))
 
     save_state(state, state_file)
     generate_results_md(state, run_time, len(profiles), results_file)
@@ -438,7 +457,7 @@ def run(
         f"Run complete: {n_stealth} stealth signals, {n_changes} job changes, "
         f"{n_unchanged} unchanged, {n_failed} failed"
     )
-    print(summary)
+    logger.info(summary)
     return summary
 
 
