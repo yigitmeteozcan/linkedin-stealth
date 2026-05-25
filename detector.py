@@ -5,7 +5,7 @@ Responsibility: given the previous state for a person and a new scrape result,
 classify what changed and whether it looks like a stealth startup signal.
 """
 
-from typing import Dict, Optional
+from typing import Dict, FrozenSet, Optional
 
 from utils import sanitize_string
 
@@ -16,7 +16,7 @@ STATUS_NO_CHANGE = "NO_CHANGE"
 STATUS_NEW = "NEW"
 STATUS_FAILED = "FAILED"
 
-STEALTH_KEYWORDS = [
+STEALTH_KEYWORDS: FrozenSet[str] = frozenset({
     "stealth",
     "stealth startup",
     "founder",
@@ -40,9 +40,9 @@ STEALTH_KEYWORDS = [
     "kuruyor",
     "inşa ediyor",
     "girişimci",
-]
+})
 
-BLANK_SIGNALS = [
+BLANK_SIGNALS: FrozenSet[str] = frozenset({
     "",
     "open to work",
     "seeking opportunities",
@@ -52,9 +52,9 @@ BLANK_SIGNALS = [
     "freelance",
     "consultant",
     "independent",
-]
+})
 
-SENIOR_TITLES = [
+SENIOR_TITLES: FrozenSet[str] = frozenset({
     "director",
     "vp",
     "vice president",
@@ -72,66 +72,35 @@ SENIOR_TITLES = [
     "managing director",
     "general manager",
     "president",
-]
+})
 
 
 def _normalize(text: str) -> str:
-    """
-    Sanitize and lowercase a string for safe keyword comparison.
-
-    Args:
-        text: Raw string from scrape or state.
-
-    Returns:
-        NFKC-normalized, lowercased, stripped string.
-    """
+    """Sanitize and lowercase a string for safe keyword comparison."""
     return sanitize_string(text).lower()
 
 
-def _find_stealth_keyword(text: str) -> Optional[str]:
+def _matches_any(text: str, keywords: FrozenSet[str]) -> Optional[str]:
     """
-    Return the first stealth keyword found in text, or None.
+    Return the first keyword from *keywords* found as a substring of *text*,
+    or None if no keyword matches.
 
     Args:
         text: Normalized (lowercased) text to search.
+        keywords: Frozenset of lowercase keyword strings.
 
     Returns:
-        Matched keyword string, or None if no match.
+        Matched keyword string, or None.
     """
-    for keyword in STEALTH_KEYWORDS:
-        if keyword.lower() in text:
+    for keyword in keywords:
+        if keyword in text:
             return keyword
     return None
 
 
 def _is_blank_signal(title: str) -> bool:
-    """
-    Return True if the title is empty or matches a known blank/passive signal.
-
-    Args:
-        title: Normalized (lowercased) title string.
-
-    Returns:
-        True if the title looks like a gap or passive listing.
-    """
-    stripped = title.strip()
-    return stripped in BLANK_SIGNALS
-
-
-def _is_senior_title(title: str) -> bool:
-    """
-    Return True if the title contains a senior-level keyword.
-
-    Args:
-        title: Normalized (lowercased) title string.
-
-    Returns:
-        True if any senior keyword appears in the title.
-    """
-    for keyword in SENIOR_TITLES:
-        if keyword.lower() in title:
-            return True
-    return False
+    """Return True if the title is empty or matches a known blank/passive signal."""
+    return title.strip() in BLANK_SIGNALS
 
 
 def _make_result(
@@ -141,19 +110,7 @@ def _make_result(
     confidence: str,
     reason: str,
 ) -> Dict:
-    """
-    Construct a DetectionResult dict.
-
-    Args:
-        status: One of STATUS_* constants.
-        previous_title: Raw previous title string.
-        current_title: Raw current title string.
-        confidence: "high", "medium", or "low".
-        reason: Human-readable explanation of the classification.
-
-    Returns:
-        DetectionResult dict.
-    """
+    """Construct a DetectionResult dict."""
     return {
         "status": status,
         "previous_title": previous_title,
@@ -168,10 +125,11 @@ def detect(old_state: Optional[Dict], scrape_result: Dict) -> Dict:
     Classify what happened to a person based on previous state and new scrape.
 
     Classification priority:
-        FAILED   → scrape failed (success=False)
-        NEW      → no previous state for this person
-        STEALTH  → stealth keyword in new title/snippet (confidence: high if in title)
-        STEALTH  → title went blank/passive and was previously senior (confidence: medium)
+        FAILED     → scrape failed (success=False)
+        NEW        → no previous state for this person
+        STEALTH    → stealth keyword in new title (confidence: high)
+        STEALTH    → stealth keyword in snippet (confidence: low)
+        STEALTH    → title went blank/passive and was previously senior (confidence: medium)
         JOB_CHANGE → title changed, no stealth pattern
         NO_CHANGE  → title and snippet are identical to last run
 
@@ -192,12 +150,10 @@ def detect(old_state: Optional[Dict], scrape_result: Dict) -> Dict:
     raw_current_title = scrape_result.get("title", "")
     raw_current_snippet = scrape_result.get("snippet", "")
     raw_prev_title = old_state.get("last_title", "") if old_state else ""
-    raw_prev_snippet = old_state.get("last_snippet", "") if old_state else ""
 
     current_title = _normalize(raw_current_title)
     current_snippet = _normalize(raw_current_snippet)
     prev_title = _normalize(raw_prev_title)
-    prev_snippet = _normalize(raw_prev_snippet)
 
     if old_state is None:
         return _make_result(
@@ -205,23 +161,21 @@ def detect(old_state: Optional[Dict], scrape_result: Dict) -> Dict:
             "No previous state — first time seeing this profile",
         )
 
-    # Check stealth keywords in title first (high confidence), then snippet (low)
-    keyword_in_title = _find_stealth_keyword(current_title)
+    keyword_in_title = _matches_any(current_title, STEALTH_KEYWORDS)
     if keyword_in_title:
         return _make_result(
             STATUS_STEALTH, raw_prev_title, raw_current_title, "high",
             f"Stealth keyword \"{keyword_in_title}\" found directly in title",
         )
 
-    keyword_in_snippet = _find_stealth_keyword(current_snippet)
+    keyword_in_snippet = _matches_any(current_snippet, STEALTH_KEYWORDS)
     if keyword_in_snippet:
         return _make_result(
             STATUS_STEALTH, raw_prev_title, raw_current_title, "low",
             f"Stealth keyword \"{keyword_in_snippet}\" found in snippet",
         )
 
-    # Blank title + previously senior = medium-confidence stealth signal
-    if _is_blank_signal(current_title) and _is_senior_title(prev_title):
+    if _is_blank_signal(current_title) and _matches_any(prev_title, SENIOR_TITLES):
         return _make_result(
             STATUS_STEALTH, raw_prev_title, raw_current_title, "medium",
             f"Title went blank/passive; previously held senior role: \"{raw_prev_title}\"",
