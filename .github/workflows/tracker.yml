@@ -20,13 +20,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          # Keyed on branch so forks never share state across branches
+          key: stealth-state-${{ github.ref_name }}
+
       - name: Run tracker
         run: python tracker.py
+
+      - name: Save state cache
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: stealth-state-${{ github.ref_name }}
 
       - name: Commit results
         run: |
           git config user.name "stealth-watch[bot]"
           git config user.email "stealth-watch@users.noreply.github.com"
-          git add state.json results.md
+          git add results.md
           git diff --staged --quiet || git commit -m "chore: stealth watch run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git push
