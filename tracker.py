@@ -1,0 +1,396 @@
+"""
+Tracker module for stealth-watch — main orchestrator.
+
+Responsibility: load profiles, run scrape + detection for each, update state,
+write results.md, and print a summary. Entry point for the GitHub Actions workflow.
+"""
+
+import csv
+import json
+import logging
+import os
+import random
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
+import scraper
+import detector
+from utils import sanitize_for_log, sanitize_string
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+PROFILES_FILE = "profiles.csv"
+STATE_FILE = "state.json"
+RESULTS_FILE = "results.md"
+
+MAX_HISTORY_ENTRIES = 10
+REQUEST_DELAY_MIN = 8.0   # seconds
+REQUEST_DELAY_MAX = 20.0  # seconds
+
+REPO_URL = "https://github.com/yigitmeteozcan/stealth-watch"
+
+# SECURITY: URL must start with this prefix to be considered a valid LinkedIn profile
+LINKEDIN_URL_PREFIX = "https://linkedin.com/in/"
+LINKEDIN_ALT_PREFIX = "https://www.linkedin.com/in/"
+
+
+def _is_valid_linkedin_url(url: str) -> bool:
+    """
+    Return True only if url is a well-formed LinkedIn profile URL.
+
+    Args:
+        url: Candidate URL string.
+
+    Returns:
+        True if url begins with a linkedin.com/in/ prefix.
+    """
+    # SECURITY: strict prefix check prevents requests to arbitrary domains
+    return url.startswith(LINKEDIN_URL_PREFIX) or url.startswith(LINKEDIN_ALT_PREFIX)
+
+
+def load_profiles(profiles_file: str = PROFILES_FILE) -> List[Dict]:
+    """
+    Load and validate profiles from a CSV file.
+
+    Skips rows missing a name or linkedin_url, and rows whose linkedin_url is
+    not a valid LinkedIn profile URL. Logs a warning for each skipped row.
+
+    Args:
+        profiles_file: Path to the CSV file.
+
+    Returns:
+        List of valid profile dicts with keys: name, linkedin_url, notes.
+    """
+    profiles = []
+    try:
+        with open(profiles_file, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader, start=2):  # row 1 is header
+                name = (row.get("name") or "").strip()
+                url = (row.get("linkedin_url") or "").strip()
+                notes = (row.get("notes") or "").strip()
+
+                if not name:
+                    logger.warning("Row %d skipped: missing name", i)
+                    continue
+                if not url:
+                    logger.warning(
+                        "Row %d skipped: missing linkedin_url (name=%s)",
+                        i, sanitize_for_log(name),
+                    )
+                    continue
+                # SECURITY: validate URL before it touches the scraper
+                if not _is_valid_linkedin_url(url):
+                    logger.warning(
+                        "Row %d skipped: invalid linkedin_url %r (name=%s)",
+                        i, url, sanitize_for_log(name),
+                    )
+                    continue
+
+                profiles.append({"name": name, "linkedin_url": url, "notes": notes})
+
+    except FileNotFoundError:
+        logger.warning("Profiles file not found: %s — running with empty list", profiles_file)
+    except Exception as exc:
+        logger.error("Failed to read profiles file: %s", exc)
+
+    return profiles
+
+
+def load_state(state_file: str = STATE_FILE) -> Dict:
+    """
+    Load the persisted state from a JSON file.
+
+    Returns an empty dict if the file is missing or contains invalid JSON,
+    so a corrupted state.json never crashes the run.
+
+    Args:
+        state_file: Path to the state JSON file.
+
+    Returns:
+        Dict mapping linkedin_url to person state dicts.
+    """
+    try:
+        with open(state_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.warning("state.json had unexpected type — resetting to empty dict")
+            return {}
+        return data
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("state.json corrupted (%s) — resetting to empty dict", exc)
+        return {}
+    except Exception as exc:
+        logger.error("Unexpected error loading state: %s — resetting", exc)
+        return {}
+
+
+def save_state(state: Dict, state_file: str = STATE_FILE) -> None:
+    """
+    Atomically write state to disk: write to a .tmp file, then rename.
+
+    The rename is atomic on POSIX systems, so state.json is never left in a
+    partially-written state even if the process is killed mid-write.
+
+    Args:
+        state: Full state dict to persist.
+        state_file: Destination path for state.json.
+    """
+    tmp_file = state_file + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    # SECURITY: atomic replace — prevents corruption on crash mid-write
+    os.rename(tmp_file, state_file)
+
+
+def _now_utc() -> str:
+    """Return the current UTC time as an ISO-8601 string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _update_state_entry(
+    state: Dict,
+    profile: Dict,
+    scrape_result: Dict,
+    detection: Dict,
+) -> None:
+    """
+    Update (or create) the state entry for a profile after a scrape+detect cycle.
+
+    Appends to the history list and trims it to MAX_HISTORY_ENTRIES.
+
+    Args:
+        state: Mutable state dict (modified in place).
+        profile: Profile dict from load_profiles.
+        scrape_result: Result from scraper.scrape_profile.
+        detection: Result from detector.detect.
+    """
+    url = profile["linkedin_url"]
+    now = _now_utc()
+    existing = state.get(url, {})
+
+    new_title = scrape_result.get("title", "") if scrape_result.get("success") else existing.get("last_title", "")
+    new_snippet = scrape_result.get("snippet", "") if scrape_result.get("success") else existing.get("last_snippet", "")
+
+    title_changed = new_title != existing.get("last_title", "")
+    last_changed = now if title_changed else existing.get("last_changed", now)
+
+    history = existing.get("history", [])
+    history.append({"date": now, "title": new_title})
+    history = history[-MAX_HISTORY_ENTRIES:]  # cap at max entries
+
+    state[url] = {
+        "name": profile["name"],
+        "linkedin_url": url,
+        "notes": profile.get("notes", ""),
+        "last_title": new_title,
+        "last_snippet": new_snippet,
+        "last_checked": now,
+        "last_changed": last_changed,
+        "status": detection["status"],
+        "detection": detection,
+        "history": history,
+    }
+
+
+def _fmt_title(title: str) -> str:
+    """Return '[blank]' for empty/whitespace titles, otherwise the title itself."""
+    return title.strip() if title.strip() else "[blank]"
+
+
+def _fmt_date(iso_str: str) -> str:
+    """Return just the date portion of an ISO-8601 datetime string."""
+    return iso_str[:10] if iso_str else ""
+
+
+def generate_results_md(
+    state: Dict,
+    run_time: str,
+    total_profiles: int,
+    results_file: str = RESULTS_FILE,
+) -> None:
+    """
+    Write results.md summarising the latest tracking run.
+
+    Sections: Stealth Signals, Recent Job Changes, Active & Unchanged, Failed Scrapes.
+
+    Args:
+        state: Full state dict after the run.
+        run_time: ISO-8601 string of when the run started.
+        total_profiles: Number of profiles that were attempted.
+        results_file: Output path for results.md.
+    """
+    stealth = []
+    job_changes = []
+    unchanged = []
+    failed = []
+
+    for entry in state.values():
+        status = entry.get("status", "")
+        det = entry.get("detection", {})
+        if status == detector.STATUS_STEALTH:
+            stealth.append((entry, det))
+        elif status == detector.STATUS_JOB_CHANGE:
+            job_changes.append((entry, det))
+        elif status == detector.STATUS_FAILED:
+            failed.append((entry, det))
+        else:
+            unchanged.append(entry)
+
+    run_date = run_time[:10]
+    run_display = run_time.replace("T", " ").replace("Z", " UTC")
+
+    lines = [
+        "---",
+        "# Stealth Watch",
+        f"*Last run: {run_display} — {total_profiles} profiles monitored*",
+        "",
+        "## Stealth Signals",
+    ]
+
+    if stealth:
+        lines += [
+            "| Name | Was | Now | Confidence | LinkedIn | Detected | Notes |",
+            "|------|-----|-----|------------|----------|----------|-------|",
+        ]
+        for entry, det in stealth:
+            name = sanitize_string(entry["name"])
+            was = _fmt_title(det.get("previous_title", ""))
+            now_title = _fmt_title(det.get("current_title", ""))
+            conf = det.get("confidence", "")
+            url = entry["linkedin_url"]
+            notes = sanitize_string(entry.get("notes", ""))
+            lines.append(
+                f"| {name} | {was} | {now_title} | {conf} | [profile]({url}) | {run_date} | {notes} |"
+            )
+    else:
+        lines.append("*No stealth signals detected in this run.*")
+
+    lines += [
+        "",
+        "## Recent Job Changes",
+    ]
+
+    if job_changes:
+        lines += [
+            "| Name | Was | Now | LinkedIn | Since |",
+            "|------|-----|-----|----------|-------|",
+        ]
+        for entry, det in job_changes:
+            name = sanitize_string(entry["name"])
+            was = _fmt_title(det.get("previous_title", ""))
+            now_title = _fmt_title(det.get("current_title", ""))
+            url = entry["linkedin_url"]
+            since = _fmt_date(entry.get("last_changed", ""))
+            lines.append(f"| {name} | {was} | {now_title} | [profile]({url}) | {since} |")
+    else:
+        lines.append("*No job changes detected in this run.*")
+
+    unchanged_count = len(unchanged)
+    lines += [
+        "",
+        "## Active & Unchanged",
+        f"*{unchanged_count} profile{'s' if unchanged_count != 1 else ''} verified unchanged as of last run.*",
+        "",
+        "## Failed Scrapes",
+    ]
+
+    if failed:
+        lines += [
+            "| Name | Reason | LinkedIn |",
+            "|------|--------|----------|",
+        ]
+        for entry, det in failed:
+            name = sanitize_string(entry["name"])
+            reason = sanitize_string(det.get("reason", "unknown"))
+            url = entry["linkedin_url"]
+            lines.append(f"| {name} | {reason} | [profile]({url}) |")
+    else:
+        lines.append("*No failed scrapes.*")
+
+    lines += [
+        "",
+        "---",
+        f"*[stealth-watch]({REPO_URL}) — runs free on GitHub Actions*",
+    ]
+
+    with open(results_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _count_by_status(state: Dict) -> Tuple[int, int, int, int]:
+    """
+    Count entries by status for the summary line.
+
+    Returns:
+        Tuple of (stealth_count, job_change_count, unchanged_count, failed_count).
+    """
+    counts = {detector.STATUS_STEALTH: 0, detector.STATUS_JOB_CHANGE: 0, detector.STATUS_FAILED: 0}
+    unchanged = 0
+    for entry in state.values():
+        s = entry.get("status", "")
+        if s in counts:
+            counts[s] += 1
+        else:
+            unchanged += 1
+    return counts[detector.STATUS_STEALTH], counts[detector.STATUS_JOB_CHANGE], unchanged, counts[detector.STATUS_FAILED]
+
+
+def run(
+    profiles_file: str = PROFILES_FILE,
+    state_file: str = STATE_FILE,
+    results_file: str = RESULTS_FILE,
+) -> str:
+    """
+    Execute a full tracking cycle: scrape all profiles, detect changes, persist state.
+
+    Args:
+        profiles_file: Path to profiles CSV.
+        state_file: Path to state JSON.
+        results_file: Path to output results markdown.
+
+    Returns:
+        Summary string printed to stdout.
+    """
+    run_time = _now_utc()
+    profiles = load_profiles(profiles_file)
+    state = load_state(state_file)
+
+    for i, profile in enumerate(profiles):
+        url = profile["linkedin_url"]
+        # SECURITY: sanitize name for log output — never log raw CSV values directly
+        safe_name = sanitize_for_log(profile["name"])
+        logger.info("[%d/%d] Scraping %s", i + 1, len(profiles), safe_name)
+
+        scrape_result = scraper.scrape_profile(url)
+        old_state = state.get(url)
+        detection = detector.detect(old_state, scrape_result)
+        _update_state_entry(state, profile, scrape_result, detection)
+
+        if i < len(profiles) - 1:
+            delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
+            time.sleep(delay)
+
+    save_state(state, state_file)
+    generate_results_md(state, run_time, len(profiles), results_file)
+
+    n_stealth, n_changes, n_unchanged, n_failed = _count_by_status(state)
+    summary = (
+        f"Run complete: {n_stealth} stealth signals, {n_changes} job changes, "
+        f"{n_unchanged} unchanged, {n_failed} failed"
+    )
+    print(summary)
+    return summary
+
+
+def main() -> None:
+    """Entry point: run a full tracking cycle with default file paths."""
+    run()
+
+
+if __name__ == "__main__":
+    main()
