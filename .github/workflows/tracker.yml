@@ -10,6 +10,8 @@ on:
     - cron: '0 9 1,15 * *'   # twice a month: 1st and 15th at 9am UTC
   workflow_dispatch:           # manual run button
 
+permissions: read-all   # default-deny; job overrides only what it needs
+
 jobs:
   track:
     runs-on: ubuntu-latest
