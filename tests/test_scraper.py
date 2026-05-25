@@ -62,6 +62,8 @@ class TestRequestBehavior(unittest.TestCase):
         mock_resp.text = text
         mock_resp.status_code = status
         mock_resp.raise_for_status = MagicMock()
+        mock_resp.url = "https://www.google.com/search"
+        mock_resp.headers = {"content-type": "text/html; charset=utf-8"}
         return mock_resp
 
     def test_timeout_is_always_set(self):

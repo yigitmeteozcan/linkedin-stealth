@@ -6,11 +6,11 @@ import unicodedata
 MAX_STRING_LENGTH = 500
 MAX_LOG_STRING_LENGTH = 200
 
-# SECURITY: allowlist-based: only alphanumerics, single space, and genuinely
-# harmless punctuation survive. Parentheses () are excluded because they form
-# the $(...) command substitution syntax. \s is not used — \n/\t enable
-# log-injection. Every shell metacharacter is blocked: $ ` ; & | > < ! { } \ ( ) \n \t
-_UNSAFE_CHARS = re.compile(r"[^\w \-\.\,\@\[\]\:\/]")
+# SECURITY: strict ASCII allowlist — only a-z A-Z 0-9, single space, and five
+# harmless punctuation characters survive. \w and unicode are excluded to prevent
+# homoglyph bypass. Brackets, colon, and slash removed (they enable injection paths).
+# \s is not used — \n/\t enable log-injection. Every shell metacharacter is blocked.
+_UNSAFE_CHARS = re.compile(r"[^a-zA-Z0-9 \-\_\.\,\@]")
 
 # SECURITY: characters that break GitHub-Flavoured Markdown table cells
 _TABLE_UNSAFE = re.compile(r"[\n\r\t]")

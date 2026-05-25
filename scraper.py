@@ -246,9 +246,19 @@ def scrape_profile(linkedin_url: str) -> Dict:
             search_url,
             headers=_build_headers(),
             timeout=REQUEST_TIMEOUT,      # SECURITY: always enforce — never hang forever
-            allow_redirects=False,        # SECURITY: never follow redirect to non-Google domain
         )
         response.raise_for_status()
+
+        # SECURITY: verify final URL domain after any redirects — Google uses redirects
+        # legitimately, but we must never end up on a non-Google domain
+        final_netloc = urlparse(response.url).netloc
+        if final_netloc not in ALLOWED_REQUEST_DOMAINS:
+            return _failed_result(f"Redirected to unexpected domain: {final_netloc!r}")
+
+        # SECURITY: reject non-HTML before passing to BeautifulSoup
+        ct = response.headers.get("content-type", "")
+        if "text/html" not in ct:
+            return _failed_result(f"Unexpected Content-Type: {ct!r}")
 
         if CAPTCHA_SIGNAL in response.text.lower():
             logger.warning("CAPTCHA detected for slug %r — skipping, not retrying", slug)

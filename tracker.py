@@ -38,6 +38,17 @@ LINKEDIN_ALT_PREFIX = "https://www.linkedin.com/in/"
 # SECURITY: whitespace characters that must not appear inside a LinkedIn URL
 _URL_WHITESPACE = frozenset(" \t\n\r\f\v")
 
+# SECURITY: characters that begin a CSV formula injection attack (Excel/Sheets)
+_CSV_INJECTION_CHARS = frozenset(("=", "+", "-", "@"))
+
+MAX_STATE_FILE_BYTES = 50 * 1024 * 1024  # 50 MB — guard against DoS via oversized state.json
+
+
+def _defuse_formula(value: str) -> str:
+    if value and value[0] in _CSV_INJECTION_CHARS:
+        return "'" + value  # SECURITY: defuse CSV formula injection
+    return value
+
 
 def _is_valid_linkedin_url(url: str) -> bool:
     """
@@ -100,6 +111,9 @@ def load_profiles(profiles_file: str = PROFILES_FILE) -> List[Dict]:
                     )
                     continue
 
+                # SECURITY: defuse CSV formula injection before storing
+                name = _defuse_formula(name)
+                notes = _defuse_formula(notes)
                 profiles.append({"name": name, "linkedin_url": url, "notes": notes})
 
     except FileNotFoundError:
@@ -124,6 +138,14 @@ def load_state(state_file: str = STATE_FILE) -> Dict:
         Dict mapping linkedin_url to person state dicts.
     """
     try:
+        try:
+            size = os.path.getsize(state_file)
+            if size > MAX_STATE_FILE_BYTES:
+                logger.warning("state.json exceeds size limit (%d bytes) — resetting", size)
+                return {}
+        except OSError:
+            pass
+
         with open(state_file, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):

@@ -1,16 +1,24 @@
 name: Stealth Watch
-
+# SECURITY: schedule + manual dispatch only — no PR or push triggers.
+# This prevents pwn-request attacks: a malicious PR cannot run workflow code
+# with write access in the context of the target repo.
 on:
   schedule:
     - cron: '0 9 */2 * *'
   workflow_dispatch:
     # No inputs defined — workflow_dispatch with no inputs is safe from injection
 
+# SECURITY: default-deny all permissions at workflow level (principle of least privilege).
+# Only the 'track' job receives the specific write permission it actually needs.
+permissions: read-all
+
 jobs:
   track:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed to commit results.md; no other permissions granted
+    # SECURITY: No secrets required — this workflow reads only public Google search results.
+    # GITHUB_TOKEN is used implicitly for git push; its scope is limited to contents: write above.
     steps:
       # SECURITY: pinned to commit SHA, not mutable version tag — prevents supply chain attacks
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -23,26 +31,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Audit dependencies for known CVEs
+        # SECURITY: fail-fast — a compromised or vulnerable package aborts the job
+        # before tracker.py runs with contents: write access
+        run: pip install pip-audit && pip-audit -r requirements.txt
+
       - name: Restore state cache
         # SECURITY: state.json contains PII — kept in Actions cache, never committed
+        # restore-keys allows using a previous run's state if the exact key is missing
+        # (e.g. after bumping the -v1 suffix to intentionally bust the cache)
         uses: actions/cache@5a3ec84eff668545956fd18022c4a6b2d5b66b1c  # v4.2.3
         with:
           path: state.json
-          # Keyed on branch so forks never share state across branches
-          key: stealth-watch-state-${{ github.ref_name }}
+          # Keyed on branch so forks never share state across branches.
+          # Increment -v1 to intentionally bust the cache if the state format changes.
+          key: stealth-watch-state-${{ github.ref_name }}-v1
+          restore-keys: stealth-watch-state-${{ github.ref_name }}-
 
       - name: Run tracker
         run: python tracker.py
 
-      - name: Save state cache
-        # SECURITY: pinned to commit SHA
-        uses: actions/cache/save@5a3ec84eff668545956fd18022c4a6b2d5b66b1c  # v4.2.3
-        with:
-          path: state.json
-          key: stealth-watch-state-${{ github.ref_name }}
-
       - name: Commit results
-        # SECURITY: commit message uses only shell date — no user-controlled values
+        # SECURITY: commit message uses only shell date — no user-controlled values interpolated
         # state.json is intentionally excluded; only results.md is committed
         run: |
           git config user.name "stealth-watch[bot]"

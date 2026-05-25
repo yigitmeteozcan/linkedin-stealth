@@ -34,6 +34,8 @@ def _mock_response(text: str = "<html></html>", status: int = 200) -> MagicMock:
     r.text = text
     r.status_code = status
     r.raise_for_status = MagicMock()
+    r.url = "https://www.google.com/search"
+    r.headers = {"content-type": "text/html; charset=utf-8"}
     return r
 
 
@@ -61,7 +63,74 @@ class TestMaliciousNameSanitization(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 2: Markdown injection in name field (pipe characters)
+# SCENARIO 2: CSV formula injection
+# ---------------------------------------------------------------------------
+
+class TestCsvFormulaInjection(unittest.TestCase):
+    """SCENARIO: CSV fields starting with =, +, -, @ must be defused before use."""
+
+    def test_equals_formula_defused_in_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.csv")
+            # Use _write_csv (DictWriter) so the formula is properly CSV-quoted
+            _write_csv(path, [
+                {"name": '=HYPERLINK("http://evil.com","click")',
+                 "linkedin_url": "https://linkedin.com/in/victim", "notes": "test"},
+            ])
+            profiles = tracker.load_profiles(path)
+            self.assertTrue(len(profiles) > 0, "Profile should be loaded (defused, not rejected)")
+            name = profiles[0]["name"]
+            self.assertFalse(name.startswith("="), f"CSV = formula not defused: {name!r}")
+
+    def test_plus_formula_defused_in_notes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.csv")
+            _write_csv(path, [
+                {"name": "Alice", "linkedin_url": "https://linkedin.com/in/alice",
+                 "notes": "+cmd|calc.exe"},
+            ])
+            profiles = tracker.load_profiles(path)
+            self.assertTrue(len(profiles) > 0)
+            notes = profiles[0]["notes"]
+            self.assertFalse(notes.startswith("+"), f"CSV + formula not defused: {notes!r}")
+
+    def test_at_formula_defused_in_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.csv")
+            _write_csv(path, [
+                {"name": "@SUM(1,2)", "linkedin_url": "https://linkedin.com/in/victim",
+                 "notes": "test"},
+            ])
+            profiles = tracker.load_profiles(path)
+            self.assertTrue(len(profiles) > 0)
+            name = profiles[0]["name"]
+            self.assertFalse(name.startswith("@"), f"CSV @ formula not defused: {name!r}")
+
+    def test_minus_formula_defused_in_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.csv")
+            _write_csv(path, [
+                {"name": "-2+3", "linkedin_url": "https://linkedin.com/in/victim", "notes": "test"},
+            ])
+            profiles = tracker.load_profiles(path)
+            self.assertTrue(len(profiles) > 0)
+            name = profiles[0]["name"]
+            self.assertFalse(name.startswith("-"), f"CSV - formula not defused: {name!r}")
+
+    def test_safe_name_not_modified(self):
+        """A name that does not start with a formula char must not be altered."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test.csv")
+            _write_csv(path, [
+                {"name": "Alice Smith", "linkedin_url": "https://linkedin.com/in/alice",
+                 "notes": "ok"},
+            ])
+            profiles = tracker.load_profiles(path)
+            self.assertEqual(profiles[0]["name"], "Alice Smith")
+
+
+# ---------------------------------------------------------------------------
+# SCENARIO 3: Markdown injection in name field (pipe characters)
 # ---------------------------------------------------------------------------
 
 class TestMarkdownPipeInjection(unittest.TestCase):
@@ -109,7 +178,7 @@ class TestMarkdownPipeInjection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 3: Newline injection in notes field
+# SCENARIO 4: Newline injection in notes field
 # ---------------------------------------------------------------------------
 
 class TestNewlineInjectionInNotes(unittest.TestCase):
@@ -151,7 +220,7 @@ class TestNewlineInjectionInNotes(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 4: URL with embedded whitespace
+# SCENARIO 5: URL with embedded whitespace
 # ---------------------------------------------------------------------------
 
 class TestUrlWithWhitespace(unittest.TestCase):
@@ -200,7 +269,7 @@ class TestUrlWithWhitespace(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 5: Redirect from google.com
+# SCENARIO 6: Redirect to non-Google domain
 # ---------------------------------------------------------------------------
 
 class TestRedirectFromGoogle(unittest.TestCase):
@@ -209,17 +278,22 @@ class TestRedirectFromGoogle(unittest.TestCase):
     def setUp(self):
         scraper._prev_user_agent = None
 
-    def test_allow_redirects_is_false(self):
-        """Verify allow_redirects=False is passed on every requests.get call."""
-        with patch("scraper.requests.get") as mock_get:
-            mock_get.return_value = _mock_response()
-            scraper.scrape_profile("https://linkedin.com/in/test-person")
-            call_kwargs = mock_get.call_args[1]
-            self.assertIn("allow_redirects", call_kwargs)
-            self.assertFalse(call_kwargs["allow_redirects"])
+    def test_redirect_to_non_google_domain_returns_failure(self):
+        """A response whose final URL is not google.com must return success=False."""
+        redirect_response = MagicMock()
+        redirect_response.text = "<html></html>"
+        redirect_response.raise_for_status = MagicMock()
+        redirect_response.url = "https://evil.com/phishing"
+        redirect_response.headers = {"content-type": "text/html"}
 
-    def test_redirect_response_handled_as_failure(self):
-        """A 301 redirect response must not propagate — raise_for_status will catch it."""
+        with patch("scraper.requests.get", return_value=redirect_response):
+            result = scraper.scrape_profile("https://linkedin.com/in/test-person")
+
+        self.assertFalse(result["success"])
+        self.assertIn("evil.com", result["error"])
+
+    def test_redirect_response_with_bad_status_returns_failure(self):
+        """A response that raises on raise_for_status must return success=False."""
         redirect_response = MagicMock()
         redirect_response.status_code = 301
         redirect_response.text = ""
@@ -232,20 +306,36 @@ class TestRedirectFromGoogle(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 6: Non-HTML (binary) Google response
+# SCENARIO 7: Non-HTML (binary) Google response
 # ---------------------------------------------------------------------------
 
 class TestNonHtmlGoogleResponse(unittest.TestCase):
-    """SCENARIO: binary response from Google must return success=False without crashing."""
+    """SCENARIO: binary or non-HTML response from Google must return success=False without crashing."""
 
     def setUp(self):
         scraper._prev_user_agent = None
+
+    def test_non_html_content_type_returns_failure(self):
+        """A response with Content-Type: application/pdf must return success=False."""
+        pdf_response = MagicMock()
+        pdf_response.text = "%PDF-1.4 fake content"
+        pdf_response.raise_for_status = MagicMock()
+        pdf_response.url = "https://www.google.com/search"
+        pdf_response.headers = {"content-type": "application/pdf"}
+
+        with patch("scraper.requests.get", return_value=pdf_response):
+            result = scraper.scrape_profile("https://linkedin.com/in/test-person")
+
+        self.assertFalse(result["success"])
+        self.assertIn("Content-Type", result["error"])
 
     def test_binary_content_returns_failure_not_exception(self):
         binary_response = MagicMock()
         # Simulate binary content decoded as text (garbled but won't crash)
         binary_response.text = "\x00\x01\x02\x03\xff\xfe binary garbage"
         binary_response.raise_for_status = MagicMock()
+        binary_response.url = "https://www.google.com/search"
+        binary_response.headers = {"content-type": "text/html; charset=utf-8"}
 
         with patch("scraper.requests.get", return_value=binary_response):
             result = scraper.scrape_profile("https://linkedin.com/in/test-person")
@@ -261,6 +351,8 @@ class TestNonHtmlGoogleResponse(unittest.TestCase):
         pdf_response = MagicMock()
         pdf_response.text = pdf_body
         pdf_response.raise_for_status = MagicMock()
+        pdf_response.url = "https://www.google.com/search"
+        pdf_response.headers = {"content-type": "application/pdf"}
 
         with patch("scraper.requests.get", return_value=pdf_response):
             result = scraper.scrape_profile("https://linkedin.com/in/test-person")
@@ -270,7 +362,7 @@ class TestNonHtmlGoogleResponse(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 7: state.json missing on first run (empty cache)
+# SCENARIO 8: state.json missing on first run (empty cache)
 # ---------------------------------------------------------------------------
 
 class TestStateMissingOnFirstRun(unittest.TestCase):
@@ -304,7 +396,48 @@ class TestStateMissingOnFirstRun(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 8: Extremely long name (10,000 chars)
+# SCENARIO 9: state.json corrupted
+# ---------------------------------------------------------------------------
+
+class TestCorruptedStateJson(unittest.TestCase):
+    """SCENARIO: state.json = '}{invalid json}{' must reset to empty and continue without crash."""
+
+    def test_corrupted_state_returns_empty_dict(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            f.write("}{invalid json}{")
+            path = f.name
+        try:
+            state = tracker.load_state(path)
+            self.assertIsInstance(state, dict)
+            self.assertEqual(len(state), 0)
+        finally:
+            os.unlink(path)
+
+    def test_corrupted_state_does_not_crash_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "profiles.csv")
+            state_path = os.path.join(tmpdir, "state.json")
+            results_path = os.path.join(tmpdir, "results.md")
+
+            with open(state_path, "w", encoding="utf-8") as f:
+                f.write("}{invalid json}{")
+
+            _write_csv(csv_path, [
+                {"name": "Alice", "linkedin_url": "https://linkedin.com/in/alice", "notes": ""},
+            ])
+
+            def fake_scrape(url):
+                return {"success": True, "title": "Engineer", "snippet": "", "raw": "", "error": None}
+
+            with patch("tracker.scraper.scrape_profile", side_effect=fake_scrape), \
+                 patch("tracker.time.sleep"):
+                summary = tracker.run(csv_path, state_path, results_path)
+
+            self.assertIn("Run complete", summary)
+
+
+# ---------------------------------------------------------------------------
+# SCENARIO 10: Extremely long name (10,000 chars)
 # ---------------------------------------------------------------------------
 
 class TestExtremelyLongName(unittest.TestCase):
@@ -345,7 +478,36 @@ class TestExtremelyLongName(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# SCENARIO 9: profiles.csv with 500 rows
+# SCENARIO 11: python-dotenv not used
+# ---------------------------------------------------------------------------
+
+class TestPythonDotenvUnused(unittest.TestCase):
+    """SCENARIO: python-dotenv must not appear in requirements.txt or any source file."""
+
+    def _src_dir(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_dotenv_not_in_requirements(self):
+        req_path = os.path.join(self._src_dir(), "requirements.txt")
+        with open(req_path, encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn("dotenv", content.lower(),
+                         "python-dotenv must not be in requirements.txt")
+
+    def test_dotenv_not_imported_in_source(self):
+        src_dir = self._src_dir()
+        for filename in ["tracker.py", "scraper.py", "utils.py", "detector.py"]:
+            filepath = os.path.join(src_dir, filename)
+            if not os.path.exists(filepath):
+                continue
+            with open(filepath, encoding="utf-8") as f:
+                src = f.read()
+            self.assertNotIn("dotenv", src,
+                             f"dotenv found imported in {filename}")
+
+
+# ---------------------------------------------------------------------------
+# Extra: Large profiles CSV and empty profiles (regression guards)
 # ---------------------------------------------------------------------------
 
 class TestLargeProfilesCsv(unittest.TestCase):
@@ -368,10 +530,6 @@ class TestLargeProfilesCsv(unittest.TestCase):
         finally:
             os.unlink(path)
 
-
-# ---------------------------------------------------------------------------
-# SCENARIO 10: results.md generated correctly with no profiles
-# ---------------------------------------------------------------------------
 
 class TestResultsMdWithNoProfiles(unittest.TestCase):
     """SCENARIO: empty profiles.csv must still produce a valid results.md."""
