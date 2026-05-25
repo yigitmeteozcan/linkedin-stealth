@@ -2,7 +2,7 @@
 
 # stealth-watch
 
-Track when senior people go stealth. Runs free on GitHub Actions. No API keys. No servers.
+Track when LinkedIn people go stealth or change positions. VC deal scourcing. Runs free on GitHub Actions. No API keys. No servers.
 
 ---
 
